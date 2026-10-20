@@ -248,8 +248,6 @@ Exit the SSM session (`exit`), then from your local machine:
 npx aws-cdk@2 destroy KafkaSimpleCdkStack --force
 ```
 
-(Or start the [destroy project](#destroy).)
-
 This tears down the EC2 instance, security group, IAM role/instance profile, and the broker
 credentials secret created by this stack. It does NOT touch the account's default VPC or its
 subnets — they were only ever looked up, never owned by this stack.
@@ -311,8 +309,8 @@ rm -rf .venv cdk.out
 
 The pipeline is defined in this CDK app as [`KafkaPipelineStack`](kafka_cdk/pipeline_stack.py).
 Every push to `pipeline.branch` runs the unit tests. The pipeline never synthesizes for deploy,
-deploys, or updates itself: deploys (Steps 1–8) and changes to the pipeline are done by hand
-with `cdk deploy`. Step 9 can also be done with the separate [destroy project](#destroy).
+deploys, destroys, or updates itself: deploys (Steps 1–8), clean-up (Step 9) and changes to the
+pipeline are done by hand with the CDK CLI.
 
 ```
 Source ──► UnitTests
@@ -337,31 +335,6 @@ run `cdk deploy KafkaPipelineStack`.
 | `branch` | `main` | branch that triggers it |
 | `connection_arn` | *(empty: no pipeline stack until set)* | ARN of an **AVAILABLE** AWS CodeConnections connection to that repo |
 
-### Destroy
-
-The pipeline never deletes anything. To tear the Kafka stack down without a local checkout, start the
-`kafka-simple-cdk-destroy` CodeBuild project. It refuses to run unless you confirm the stack name:
-
-```bash
-aws codebuild start-build --region us-east-1 --project-name kafka-simple-cdk-destroy \
-  --environment-variables-override \
-    name=CONFIRM_STACK_NAME,value=KafkaSimpleCdkStack \
-    name=FORCE_DELETE_SECRET,value=false
-```
-
-(Or use *Start build with overrides* in the console.) The project:
-
-1. runs `delete-stack` and waits for it to finish,
-2. checks that the stack is gone,
-3. if `FORCE_DELETE_SECRET=true`, purges the broker secret so you can redeploy immediately (see
-   the Secrets Manager gotcha above).
-
-It uses plain CloudFormation, so it needs no checkout or synth.
-
-Access is controlled by IAM: whoever can call `codebuild:StartBuild` on this project can destroy
-the stack. To remove everything, run the destroy project first, then
-`npx aws-cdk@2 destroy KafkaPipelineStack`.
-
 ### Setup
 
 1. **Push this project** to the GitHub repo named in `pipeline.repo`.
@@ -384,8 +357,6 @@ the stack. To remove everything, run the destroy project first, then
 
 - **UnitTests:** only the CodeBuild defaults (logs, reports, artifact bucket); no AWS access
   beyond that.
-- **Destroy project:** may call `DeleteStack` on `KafkaSimpleCdkStack` only, `PassRole` the
-  cfn-exec role to CloudFormation, and delete the `kafka-simple-cdk-broker-credentials-*` secret.
 
 **Not included: pull-request builds.** The pipeline runs only on pushes to `pipeline.branch`. To
 validate PRs before merge, add a CodeBuild project with a GitHub webhook that runs the unit

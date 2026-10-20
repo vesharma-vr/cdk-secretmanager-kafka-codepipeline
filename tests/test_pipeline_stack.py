@@ -9,14 +9,9 @@ import pathlib
 
 import aws_cdk as cdk
 import pytest
-from aws_cdk.assertions import Match, Template
+from aws_cdk.assertions import Template
 
-from kafka_cdk.pipeline_stack import (
-    DESTROY_PROJECT_NAME,
-    PIPELINE_NAME,
-    STACK_NAME,
-    KafkaPipelineStack,
-)
+from kafka_cdk.pipeline_stack import PIPELINE_NAME, KafkaPipelineStack
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 REGION = "us-east-1"
@@ -78,25 +73,3 @@ def test_unit_tests_project_runs_pytest_and_nothing_else(template):
     for absent in ("cdk synth", "cdk deploy", "cfn-lint"):
         assert absent not in spec
 
-
-def test_destroy_project_is_confirmed_and_narrowly_scoped(template):
-    template.has_resource_properties(
-        "AWS::CodeBuild::Project",
-        {
-            "Name": DESTROY_PROJECT_NAME,
-            "Source": {"BuildSpec": Match.string_like_regexp(r"CONFIRM_STACK_NAME")},
-        },
-    )
-    statements = [
-        s
-        for p in template.find_resources("AWS::IAM::Policy").values()
-        for s in p["Properties"]["PolicyDocument"]["Statement"]
-        if s["Action"] in (["cloudformation:DeleteStack", "cloudformation:DescribeStacks"], "iam:PassRole")
-    ]
-    assert len(statements) == 2
-    delete, pass_role = statements
-    assert f":stack/{STACK_NAME}/*" in json.dumps(delete["Resource"])
-    assert "cfn-exec-role" in json.dumps(pass_role["Resource"])
-    assert pass_role["Condition"] == {
-        "StringEquals": {"iam:PassedToService": "cloudformation.amazonaws.com"}
-    }
