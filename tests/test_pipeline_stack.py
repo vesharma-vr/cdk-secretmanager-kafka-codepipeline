@@ -1,7 +1,7 @@
 """
-Unit tests for KafkaPipelineStack -- the CodePipeline that delivers
-KafkaSimpleCdkStack. Like the stack tests, these synthesize offline from the
-committed cdk.context.json.
+Unit tests for KafkaPipelineStack -- the CodePipeline that runs this app's
+unit tests. Like the stack tests, these synthesize offline from the committed
+cdk.context.json.
 """
 
 import json
@@ -26,7 +26,8 @@ CONNECTION_ARN = (
 )
 
 
-def _synth(**overrides):
+@pytest.fixture(scope="module")
+def template():
     context = json.loads((PROJECT_ROOT / "cdk.context.json").read_text())
     vpc_key = next(k for k in context if k.startswith("vpc-provider:"))
     account = vpc_key.split("account=", 1)[1].split(":", 1)[0]
@@ -38,14 +39,8 @@ def _synth(**overrides):
         branch="main",
         connection_arn=CONNECTION_ARN,
         env=cdk.Environment(account=account, region=REGION),
-        **overrides,
     )
-    return app, stack, Template.from_stack(stack)
-
-
-@pytest.fixture(scope="module")
-def synthed():
-    return _synth()
+    return Template.from_stack(stack)
 
 
 def _stages(template):
@@ -53,93 +48,38 @@ def _stages(template):
     return {s["Name"]: s["Actions"] for s in pipeline["Properties"]["Stages"]}
 
 
-def test_pipeline_shape(synthed):
-    _, _, template = synthed
+def test_pipeline_is_source_then_unit_tests_only(template):
     template.has_resource_properties(
         "AWS::CodePipeline::Pipeline",
         {"Name": PIPELINE_NAME, "PipelineType": "V2"},
     )
-    assert list(_stages(template)) == ["Source", "Build", "UpdatePipeline", "Prod"]
+    stages = _stages(template)
+    assert list(stages) == ["Source", "UnitTests"]
 
-    source = _stages(template)["Source"][0]
+    source = stages["Source"][0]
     assert source["ActionTypeId"]["Provider"] == "CodeStarSourceConnection"
     assert source["Configuration"]["ConnectionArn"] == CONNECTION_ARN
     assert source["Configuration"]["FullRepositoryId"] == "example-org/example-repo"
     assert source["Configuration"]["BranchName"] == "main"
 
-
-def test_prod_stage_approves_the_change_set_then_smoke_tests(synthed):
-    _, _, template = synthed
-    actions = sorted(_stages(template)["Prod"], key=lambda a: a["RunOrder"])
-    steps = [
-        (a["Name"], a["ActionTypeId"]["Provider"], a.get("Configuration", {}).get("ActionMode"))
-        for a in actions
-    ]
-    assert steps == [
-        (f"{STACK_NAME}.Prepare", "CloudFormation", "CHANGE_SET_REPLACE"),
-        (f"{STACK_NAME}.Approve", "Manual", None),
-        (f"{STACK_NAME}.Deploy", "CloudFormation", "CHANGE_SET_EXECUTE"),
-        ("SmokeTest", "CodeBuild", None),
-    ]
-    # Same CloudFormation name as a local deploy, not "Prod-KafkaSimpleCdkStack".
-    assert actions[0]["Configuration"]["StackName"] == STACK_NAME
+    assert [a["ActionTypeId"]["Provider"] for a in stages["UnitTests"]] == ["CodeBuild"]
 
 
-def test_approval_and_smoke_test_can_be_switched_off():
-    _, _, template = _synth(require_approval=False, run_smoke_tests=False)
-    providers = [
-        (a["ActionTypeId"]["Provider"], a["Configuration"].get("ActionMode"))
-        for a in sorted(_stages(template)["Prod"], key=lambda a: a["RunOrder"])
-    ]
-    assert providers == [
-        ("CloudFormation", "CHANGE_SET_REPLACE"),
-        ("CloudFormation", "CHANGE_SET_EXECUTE"),
-    ]
-
-
-def test_synth_runs_tests_drift_check_and_lint(synthed):
-    _, _, template = synthed
+def test_unit_tests_project_runs_pytest_and_nothing_else(template):
     projects = template.find_resources("AWS::CodeBuild::Project")
-    synth_specs = [
+    specs = [
         p["Properties"]["Source"]["BuildSpec"]
         for p in projects.values()
-        if "cdk synth" in p["Properties"]["Source"].get("BuildSpec", "")
+        if "pytest" in p["Properties"]["Source"].get("BuildSpec", "")
     ]
-    assert len(synth_specs) == 1
-    spec = synth_specs[0]
-    for expected in ("python -m pytest", "cmp -s cdk.context.json", "cfn-lint --non-zero-exit-code error"):
-        assert expected in spec
+    assert len(specs) == 1
+    spec = specs[0]
+    assert "python -m pytest" in spec
+    for absent in ("cdk synth", "cdk deploy", "cfn-lint"):
+        assert absent not in spec
 
 
-def test_smoke_test_gets_instance_id_and_scoped_ssm(synthed):
-    _, _, template = synthed
-    projects = template.find_resources("AWS::CodeBuild::Project")
-    smoke = [p for p in projects.values() if "smoke_test.sh" in p["Properties"]["Source"].get("BuildSpec", "")]
-    assert len(smoke) == 1
-
-    template.has_resource_properties(
-        "AWS::IAM::Policy",
-        {
-            "PolicyDocument": {
-                "Statement": Match.array_with(
-                    [
-                        Match.object_like(
-                            {
-                                "Action": "ssm:SendCommand",
-                                "Condition": {
-                                    "StringEquals": {"ssm:resourceTag/Project": "kafka-simple-no-msk"}
-                                },
-                            }
-                        )
-                    ]
-                )
-            }
-        },
-    )
-
-
-def test_destroy_project_is_confirmed_and_narrowly_scoped(synthed):
-    _, _, template = synthed
+def test_destroy_project_is_confirmed_and_narrowly_scoped(template):
     template.has_resource_properties(
         "AWS::CodeBuild::Project",
         {
@@ -160,13 +100,3 @@ def test_destroy_project_is_confirmed_and_narrowly_scoped(synthed):
     assert pass_role["Condition"] == {
         "StringEquals": {"iam:PassedToService": "cloudformation.amazonaws.com"}
     }
-
-
-def test_prod_stage_contains_the_kafka_stack(synthed):
-    app, _, _ = synthed
-    assembly = app.synth()
-    nested = [a for a in assembly.nested_assemblies]
-    assert len(nested) == 1
-    stacks = nested[0].nested_assembly.stacks
-    assert [s.stack_name for s in stacks] == [STACK_NAME]
-    Template.from_json(stacks[0].template).resource_count_is("AWS::EC2::Instance", 1)

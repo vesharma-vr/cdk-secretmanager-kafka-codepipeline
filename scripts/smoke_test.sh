@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# Post-deploy verification for KafkaSimpleCdkStack -- run by the pipeline's
-# "SmokeTest" CodeBuild step (which passes INSTANCE_ID from the stack output),
-# but works the same from a laptop:
+# Post-deploy verification for KafkaSimpleCdkStack. Run it by hand after a
+# deploy:
 #
 #   scripts/smoke_test.sh cdk-outputs.json
 #   INSTANCE_ID=i-0123456789abcdef0 scripts/smoke_test.sh

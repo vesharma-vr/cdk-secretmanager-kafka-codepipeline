@@ -18,9 +18,7 @@
     "pipeline": {
       "repo": "vesharma-vr/cdk-secretmanager-kafka-codepipeline",
       "branch": "main",
-      "connection_arn": "",
-      "require_approval": true,
-      "run_smoke_tests": true
+      "connection_arn": ""
     },
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:checkSecretUsage": true,

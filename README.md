@@ -106,8 +106,9 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate.bat
 pip install -r requirements.txt
 ```
 
-The app needs `pipeline.connection_arn` in `cdk.json` before it will synthesize. See
-[CI/CD with AWS CodePipeline](#cicd-with-aws-codepipeline) → *Setup*, steps 2–3.
+The app's CI pipeline stack (`KafkaPipelineStack`) is only added once `pipeline.connection_arn`
+is set in `cdk.json`. Until then the app contains just `KafkaSimpleCdkStack`. See
+[CI with AWS CodePipeline](#ci-with-aws-codepipeline).
 
 ## Step 2 — Bootstrap CDK (first time only, per account/region)
 
@@ -139,12 +140,11 @@ default VPC configuration ever changes.
 
 ## Step 4 — Deploy
 
-Normally the pipeline does this (see [CI/CD with AWS CodePipeline](#cicd-with-aws-codepipeline)).
-To deploy the Kafka stack straight from a laptop instead, name it by its path inside the
-pipeline's `Prod` stage. A plain `cdk deploy` would deploy the pipeline:
+Deploys are done by hand; the pipeline only runs the unit tests. Name the stack, so that
+`cdk deploy` doesn't also deploy the pipeline stack once it is configured:
 
 ```bash
-npx aws-cdk@2 deploy KafkaPipelineStack/Prod/KafkaSimpleCdkStack --require-approval never
+npx aws-cdk@2 deploy KafkaSimpleCdkStack --require-approval never
 ```
 
 Deployment takes roughly 3 minutes (IAM role/instance profile creation has an inherent
@@ -245,11 +245,10 @@ SASL is not in effect; check `grep -c SASL /opt/kafka/config/server.properties` 
 Exit the SSM session (`exit`), then from your local machine:
 
 ```bash
-npx aws-cdk@2 destroy KafkaPipelineStack/Prod/KafkaSimpleCdkStack --force
+npx aws-cdk@2 destroy KafkaSimpleCdkStack --force
 ```
 
-(Or start the pipeline's [destroy project](#destroy). Either way, the pipeline redeploys the
-stack on the next push to `main`.)
+(Or start the [destroy project](#destroy).)
 
 This tears down the EC2 instance, security group, IAM role/instance profile, and the broker
 credentials secret created by this stack. It does NOT touch the account's default VPC or its
@@ -308,52 +307,39 @@ rm -rf .venv cdk.out
 
 (Keep `cdk.context.json` — it's meant to be committed.)
 
-## CI/CD with AWS CodePipeline
+## CI with AWS CodePipeline
 
-The pipeline is defined in this CDK app as [`KafkaPipelineStack`](kafka_cdk/pipeline_stack.py),
-using **CDK Pipelines** (`aws_cdk.pipelines`). After you deploy it once from a laptop, it
-**updates itself**: every push to `main` re-synthesizes the app, redeploys the pipeline if its
-definition changed, and then promotes `KafkaSimpleCdkStack`. The pipeline automates Steps 3–8
-above. Step 9 is the separate [destroy project](#destroy).
+The pipeline is defined in this CDK app as [`KafkaPipelineStack`](kafka_cdk/pipeline_stack.py).
+Every push to `pipeline.branch` runs the unit tests. The pipeline never synthesizes for deploy,
+deploys, or updates itself: deploys (Steps 1–8) and changes to the pipeline are done by hand
+with `cdk deploy`. Step 9 can also be done with the separate [destroy project](#destroy).
 
 ```
-Source ──► Build (CodeBuild "Synth") ──────────────────────► UpdatePipeline ──► Prod ──────────────────────────────────────────►
-GitHub     pytest → cdk synth → cfn-lint                     (self-mutation)    change set → Approve → execute → SmokeTest
-push       (context-drift check)                                                (CloudFormation) (manual)        (CodeBuild, SSM)
+Source ──► UnitTests
+GitHub     CodeBuild: pytest
+push
 ```
 
-| Stage / action | What it does | Fails / blocks when |
+| Stage | What it does | Fails when |
 |---|---|---|
 | Source | CodeConnections (GitHub) source on `pipeline.branch` | — |
-| Build → Synth | installs `requirements-dev.txt` and the pinned CDK CLI (2.1145.0). Runs [`tests/`](tests/), then `cdk synth`, then `cfn-lint` on every template. JUnit results show under CodeBuild → *Report groups* | a test fails, synth fails, cfn-lint *errors* (warnings are only reported), or synth had to do a fresh VPC lookup and changed `cdk.context.json`. The build log prints the new file; commit it |
-| UpdatePipeline | redeploys `KafkaPipelineStack` if the pipeline definition changed, then restarts the run | — |
-| Prod → Prepare | creates a CloudFormation **change set** for `KafkaSimpleCdkStack` from the `cdk.out` built above (no re-synth) | template invalid |
-| Prod → Approve | CodePipeline manual approval. Review the pending change set in the CloudFormation console, then approve or reject. Rejecting is the "plan only" path | rejected or not approved within 7 days |
-| Prod → Deploy | executes the approved change set | CloudFormation failure |
-| Prod → SmokeTest | [`scripts/smoke_test.sh`](scripts/smoke_test.sh) in CodeBuild, with `INSTANCE_ID` taken from the stack output. It waits for SSM Online and for cloud-init + `kafka.service`, then does an authenticated create/produce/consume round-trip and confirms an **unauthenticated** client is rejected | any check fails |
+| UnitTests | CodeBuild project `kafka-simple-cdk-unit-tests`: installs `requirements-dev.txt` and runs [`tests/`](tests/), which synthesize offline from `cdk.context.json`. JUnit results show under CodeBuild → *Report groups* | a test fails |
 
-The pipeline is a V2 pipeline in the default *superseded* execution mode. Each stage runs one
-execution at a time, and a newer commit replaces an older one that is still waiting (for
-example, at the approval).
+It is a V2 pipeline in the default *superseded* execution mode. CodeBuild uses the
+`aws/codebuild/amazonlinux-x86_64-standard:5.0` image with Node 22 and Python 3.12.
 
-Every CodeBuild action uses the `aws/codebuild/amazonlinux-x86_64-standard:5.0` image with
-Node 22 and Python 3.12. The image already includes the AWS CLI v2 and jq.
-
-**Settings** (`"pipeline"` in [`cdk.json`](cdk.json)). They must be **committed**, because the
-pipeline re-synthesizes the app from the repo. A change takes effect on the next push, through
-self-mutation.
+**Settings** (`"pipeline"` in [`cdk.json`](cdk.json)). Changes take effect the next time you
+run `cdk deploy KafkaPipelineStack`.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `repo` | `vesharma-vr/cdk-secretmanager-kafka-codepipeline` | `owner/repo` the pipeline watches |
 | `branch` | `main` | branch that triggers it |
-| `connection_arn` | *(empty: synth fails until set)* | ARN of an **AVAILABLE** AWS CodeConnections connection to that repo |
-| `require_approval` | `true` | `false` removes the manual approval action |
-| `run_smoke_tests` | `true` | `false` removes the SmokeTest action |
+| `connection_arn` | *(empty: no pipeline stack until set)* | ARN of an **AVAILABLE** AWS CodeConnections connection to that repo |
 
 ### Destroy
 
-The pipeline never deletes anything. To tear the Kafka stack down, start the
+The pipeline never deletes anything. To tear the Kafka stack down without a local checkout, start the
 `kafka-simple-cdk-destroy` CodeBuild project. It refuses to run unless you confirm the stack name:
 
 ```bash
@@ -373,8 +359,8 @@ aws codebuild start-build --region us-east-1 --project-name kafka-simple-cdk-des
 It uses plain CloudFormation, so it needs no checkout or synth.
 
 Access is controlled by IAM: whoever can call `codebuild:StartBuild` on this project can destroy
-the stack. The pipeline stays in place, so the **next push to `main` deploys the stack again**.
-To remove everything, run the destroy project first, then `npx aws-cdk@2 destroy KafkaPipelineStack`.
+the stack. To remove everything, run the destroy project first, then
+`npx aws-cdk@2 destroy KafkaPipelineStack`.
 
 ### Setup
 
@@ -384,36 +370,32 @@ To remove everything, run the destroy project first, then `npx aws-cdk@2 destroy
    `PENDING` until you finish this handshake in the console. It must show **Available**.
 3. **Commit the ARN.** Put the connection ARN in `cdk.json` → `pipeline.connection_arn`, then
    commit and push.
-4. **Bootstrap** the account/region once (Step 2). The pipeline deploys through the bootstrap
-   roles, so no extra trust is needed for this single-account setup.
-5. **Deploy the pipeline once**, from a laptop with admin-level credentials:
+4. **Bootstrap** the account/region once (Step 2).
+5. **Deploy the pipeline**, from a laptop with admin-level credentials:
 
    ```bash
    npx aws-cdk@2 deploy KafkaPipelineStack
    ```
 
-   It starts right away from the latest commit on `main`. Approve the change set when it reaches
-   *Prod → Approve*. From here on, change the pipeline by pushing, not by running `cdk deploy`.
+   It starts right away from the latest commit on `main`. Re-run this whenever you change the
+   pipeline.
 
-**IAM** is generated by CDK and scoped per action. You don't need to write any of it:
+**IAM** is generated by CDK. You don't need to write any of it:
 
-- **Synth:** may assume only the bootstrap *lookup* role, used only when `cdk.context.json` is
-  missing a lookup.
-- **Prod deploy:** goes through the bootstrap *deploy* and *cfn-exec* roles.
-- **SmokeTest:** may call `ssm:SendCommand` only with `AWS-RunShellScript` and only on instances
-  tagged `Project=kafka-simple-no-msk`.
+- **UnitTests:** only the CodeBuild defaults (logs, reports, artifact bucket); no AWS access
+  beyond that.
 - **Destroy project:** may call `DeleteStack` on `KafkaSimpleCdkStack` only, `PassRole` the
   cfn-exec role to CloudFormation, and delete the `kafka-simple-cdk-broker-credentials-*` secret.
 
 **Not included: pull-request builds.** The pipeline runs only on pushes to `pipeline.branch`. To
-validate PRs before merge, add a CodeBuild project with a GitHub webhook that runs the Synth
-commands. Its source credentials must be set up in the account
+validate PRs before merge, add a CodeBuild project with a GitHub webhook that runs the unit
+tests. Its source credentials must be set up in the account
 (`aws codebuild import-source-credentials`).
 
-To run the smoke test by hand after a local deploy:
+To run the smoke test after a local deploy:
 
 ```bash
-npx aws-cdk@2 deploy KafkaPipelineStack/Prod/KafkaSimpleCdkStack \
+npx aws-cdk@2 deploy KafkaSimpleCdkStack \
   --require-approval never --outputs-file cdk-outputs.json
 scripts/smoke_test.sh cdk-outputs.json
 ```
